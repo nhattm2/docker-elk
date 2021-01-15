@@ -1,0 +1,181 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluentd
+  namespace: logging
+
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluentd-clusterrole
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - "namespaces"
+      - "pods"
+    verbs:
+      - "list"
+      - "get"
+      - "watch"
+
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluentd-clusterrole
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: fluentd-clusterrole
+subjects:
+  - kind: ServiceAccount
+    name: fluentd
+    namespace: logging
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-conf
+  namespace: logging
+data:
+  fluent.conf: |
+    # Prometheus metric exposed on 0.0.0.0:24231/metrics
+    <source>
+      @type prometheus
+      bind '0.0.0.0'
+      port 24231
+      metrics_path '/metrics'
+    </source>
+
+    <source>
+      @id in_prometheus_output_monitor
+      @type prometheus_output_monitor
+    </source>
+
+    <label @FLUENT_LOG>
+      <match fluent.**>
+        @type null
+      </match>
+    </label>
+
+    <source>
+      @type tail
+      @id in_tail_container_logs
+      @label @alpha
+      path /var/log/containers/alpha-*.log
+      pos_file /var/log/fluentd-containers.log.pos
+      tag 'kubernetes.*'
+      exclude_path [
+        "/var/log/containers/alpha-n2o-kafka*.log",
+        "/var/log/containers/alpha-film-spi*.log"
+      ]
+      read_from_head true
+      <parse>
+        @type json
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+
+    <label @alpha>
+      <filter kubernetes.**>
+        @type kubernetes_metadata
+        @id filter_kube_metadata
+        kubernetes_url "#{ENV['FLUENT_FILTER_KUBERNETES_URL'] || 'https://' + ENV.fetch('KUBERNETES_SERVICE_HOST') + ':' + ENV.fetch('KUBERNETES_SERVICE_PORT') + '/api'}"
+        verify_ssl "#{ENV['KUBERNETES_VERIFY_SSL'] || true}"
+        ca_file "#{ENV['KUBERNETES_CA_FILE']}"
+        skip_labels false
+        skip_container_metadata false
+        skip_master_url false
+        skip_namespace_metadata false
+      </filter>
+      <filter kubernetes.**>
+        @type record_transformer
+        @id filter_record_transformer
+        enable_ruby true
+        remove_keys stream,docker,$.kubernetes.master_url,$.kubernetes.container_name,$.kubernetes.pod_id,$.kubernetes.container_image_id,$.kubernetes.namespace_id,$.kubernetes.labels.pod-template-hash,$.kubernetes.labels.app_kubernetes_io/name
+      </filter>
+      <match **>
+        @type kafka2
+        @id out_kafka2
+        @log_level info
+        brokers "#{ENV['FLUENT_KAFKA_BROKERS']}"
+        default_topic "#{ENV['FLUENT_KAFKA_DEFAULT_TOPIC'] || nil}"
+        compression_codec gzip
+        output_data_type json
+        get_kafka_client_log true
+        # ruby-kafka producer options
+        max_send_retries 1
+        max_send_limit_bytes 100000
+        discard_kafka_delivery_failed false
+        <format>
+          @type json
+        </format>
+        <buffer>
+          flush_mode interval
+          flush_interval 5
+          flush_thread_count 5
+          chunk_limit_size 20m
+          queue_limit_length 96
+          retry_type exponential_backoff
+        </buffer>
+      </match>
+    </label>
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: fluentd
+  namespace: logging
+  labels:
+    k8s-app: fluentd-logging
+    version: v1
+spec:
+  selector:
+    matchLabels:
+      k8s-app: fluentd-logging
+  template:
+    metadata:
+      labels:
+        k8s-app: fluentd-logging
+        version: v1
+    spec:
+      serviceAccountName: fluentd
+      containers:
+        - name: fluentd
+          image: fluent/fluentd-kubernetes-daemonset:v1.11-debian-kafka-2
+          env:
+            - name: FLUENT_KAFKA_BROKERS
+              value: "192.168.12.18:9092,192.168.12.18:9093,192.168.12.18:9094"
+            - name: FLUENT_KAFKA_DEFAULT_TOPIC
+              value: "log-k8s"
+          resources:
+            limits:
+              cpu: 100m
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+          volumeMounts:
+            - name: varlog
+              mountPath: /var/log
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+            - name: config-volume
+              mountPath: /fluentd/etc
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
+        - name: config-volume
+          configMap:
+            name: fluentd-conf
+
